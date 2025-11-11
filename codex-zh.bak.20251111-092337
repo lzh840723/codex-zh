@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# 中文输入 → 英文与 Codex 交互 → 中文输出（保护代码块）
+# - 管理/查询子命令直通：resume/status/logs/list/runs/env/stop/kill/ps/inspect/history
+# - FORCE_TRANSLATE=1 时，强制把 Codex 输出翻译为中文（即使是直通子命令）
+# - 支持：codex exec / codex cloud exec
+# - 依赖：translate-shell (trans)、python3
+# - 可选：CODEX_CMD 指定 codex 可执行名（默认 "codex"）
+
+set -euo pipefail
+
+# ---------- 依赖检查 ----------
+CODEX_CMD="${CODEX_CMD:-codex}"
+if ! command -v "$CODEX_CMD" >/dev/null 2>&1; then
+  echo "未找到可执行命令：$CODEX_CMD（可设置环境变量 CODEX_CMD 或安装官方 codex CLI）" >&2
+  exit 127
+fi
+if ! command -v trans >/dev/null 2>&1; then
+  echo "未找到 translate-shell（命令名：trans）。请先安装：brew install translate-shell" >&2
+  exit 127
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "未找到 python3，请先安装（macOS 可用 Xcode CLT 或 Homebrew）。" >&2
+  exit 127
+fi
+
+# ---------- 代码块保护的 英→中 翻译 ----------
+back_to_zh_protected() {
+python3 - <<'PY'
+import re, subprocess, sys
+txt = sys.stdin.read()
+blocks = []
+def keep(m):
+    blocks.append(m.group(0))
+    return f"§§BLOCK{len(blocks)-1}§§"
+masked = re.sub(r"```.*?```", keep, txt, flags=re.S)
+cmd = "trans -b -s en -t zh <<'EOF'\n" + masked + "\nEOF"
+out = subprocess.check_output(["bash","-lc", cmd], text=True)
+def putback(m): return blocks[int(m.group(1))]
+print(re.sub(r"§§BLOCK(\\d+)§§", putback, out))
+PY
+}
+
+# ---------- 中→英 翻译 ----------
+to_en() { trans -b -s zh -t en <<<"$1"; }
+
+# ---------- 直通白名单（管理/查询型子命令） ----------
+PASSTHRU_CMDS=("resume" "status" "logs" "list" "runs" "env" "stop" "kill" "ps" "inspect" "history")
+
+# ---------- FORCE_TRANSLATE：强制翻译 Codex 输出 ----------
+# 若设置 FORCE_TRANSLATE=1 且无 stdin（不吃提示词），则原样执行 codex，并把英文输出翻译为中文
+if [ "${FORCE_TRANSLATE:-0}" = "1" ] && [ -t 0 ] && [ $# -gt 0 ]; then
+  # 直接把 codex 输出送入翻译器（含代码块保护）
+  "$CODEX_CMD" "$@" | back_to_zh_protected
+  exit $?
+fi
+
+# ---------- 默认直通：管理/查询子命令（无 stdin 时不翻译） ----------
+if [ -t 0 ] && [[ $# -gt 0 ]]; then
+  first="$1"
+  if [[ "$first" == "cloud" && $# -gt 1 ]]; then
+    second="$2"
+    for s in "${PASSTHRU_CMDS[@]}"; do
+      if [[ "$second" == "$s" ]]; then
+        exec "$CODEX_CMD" "$@"
+      fi
+    done
+  else
+    for s in "${PASSTHRU_CMDS[@]}"; do
+      if [[ "$first" == "$s" ]]; then
+        exec "$CODEX_CMD" "$@"
+      fi
+    done
+  fi
+fi
+
+# ---------- 读取输入：优先 stdin；否则把参数拼成“中文提示词” ----------
+INPUT_CN=""
+if [ -t 0 ]; then
+  if [[ $# -gt 0 ]]; then
+    # 把所有参数视为“中文提示词”；如果你想把参数保留给 codex，请改为只取 $1 等
+    INPUT_CN="$*"
+    set --   # 清空参数，避免把英文提示又当作参数传给 codex
+  fi
+else
+  INPUT_CN="$(cat)"
+fi
+
+# 若依然没有中文提示（且也不是直通场景），给出用法提示
+if [[ -z "$INPUT_CN" ]]; then
+  cat >&2 <<'USAGE'
+用法：
+  echo "中文需求" | codex-zh [exec参数...]
+  codex-zh "中文需求" [exec参数...]
+
+直通（不翻译）示例（等同原生 codex）：
+  codex-zh resume <RUN_ID> --search
+  codex-zh status
+  codex-zh list
+
+强制翻译直通输出（FORCE_TRANSLATE=1）：
+  FORCE_TRANSLATE=1 codex-zh resume <RUN_ID> --search
+
+说明：
+  - 有中文输入时：中文 → 英文（trans）→ codex exec/cloud exec → 英文结果回译中文（保护代码块）。
+  - 无中文输入且子命令为 resume/status/logs/list/... 时：原样透传给 codex。
+  - 设置 FORCE_TRANSLATE=1 可让直通子命令的英文输出也被翻译为中文。
+USAGE
+  exit 2
+fi
+
+# ---------- 判定 exec / cloud exec ----------
+SUBCMD=("exec")
+if [[ "${1:-}" == "cloud" ]]; then
+  shift
+  SUBCMD=("cloud" "exec")
+fi
+
+# ---------- 中文 → 英文 ----------
+PROMPT_EN="$(to_en "$INPUT_CN")"
+
+# ---------- 调用 codex：优先 stdin 喂提示词；失败则走参数 ----------
+set +e
+RESP_EN="$(printf '%s' "$PROMPT_EN" | "$CODEX_CMD" "${SUBCMD[@]}" "$@")"
+status=$?
+set -e
+if [[ $status -ne 0 ]]; then
+  RESP_EN="$("$CODEX_CMD" "${SUBCMD[@]}" "$PROMPT_EN" "$@")"
+fi
+
+# ---------- 英文 → 中文（保护代码块） ----------
+printf '%s' "$RESP_EN" | back_to_zh_protected
+
